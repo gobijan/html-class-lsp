@@ -1,0 +1,12 @@
+{
+  "name": "html-class-lsp",
+  "owner": { "name": "Bijan Rahnema" },
+  "description": "The html-class-lsp language server as a Claude Code plugin",
+  "plugins": [
+    {
+      "name": "html-class-lsp",
+      "source": "./claude-plugin",
+      "description": "Warnings for CSS classes in HTML that none of the page's stylesheets define, and go to definition from a class to its rule"
+    }
+  ]
+}

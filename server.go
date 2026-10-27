@@ -12,12 +12,17 @@ import (
 	"unicode/utf16"
 )
 
-const kindClass = 7 // CompletionItemKind.Class
+const (
+	kindClass       = 7 // CompletionItemKind.Class
+	severityWarning = 2 // DiagnosticSeverity.Warning
+)
 
 type server struct {
 	docs     map[string]string // open documents by URI
 	root     string            // workspace root, for root-relative hrefs
 	utf8     bool              // positions count bytes instead of UTF-16 units
+	watch    bool              // the client can watch files for us
+	outbox   []message         // for the client, sent after the current message
 	shutdown bool
 }
 
@@ -57,6 +62,18 @@ type completionList struct {
 	Items        []completionItem `json:"items"`
 }
 
+type diagnostic struct {
+	Range    span   `json:"range"`
+	Severity int    `json:"severity"`
+	Source   string `json:"source"`
+	Message  string `json:"message"`
+}
+
+type publishParams struct {
+	URI         string       `json:"uri"`
+	Diagnostics []diagnostic `json:"diagnostics"`
+}
+
 type textDocument struct {
 	URI  string `json:"uri"`
 	Text string `json:"text"`
@@ -87,6 +104,11 @@ type initializeParams struct {
 		General struct {
 			PositionEncodings []string `json:"positionEncodings"`
 		} `json:"general"`
+		Workspace struct {
+			DidChangeWatchedFiles struct {
+				DynamicRegistration bool `json:"dynamicRegistration"`
+			} `json:"didChangeWatchedFiles"`
+		} `json:"workspace"`
 	} `json:"capabilities"`
 }
 
@@ -115,6 +137,14 @@ type rpcError struct {
 
 func (e *rpcError) Error() string { return e.Message }
 
+// message is a request or notification from the server to the client.
+type message struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      any    `json:"id,omitempty"`
+	Method  string `json:"method"`
+	Params  any    `json:"params"`
+}
+
 // serve answers LSP messages from r on w until the client sends exit or
 // closes the stream.
 func (s *server) serve(r io.Reader, w io.Writer) error {
@@ -137,29 +167,57 @@ func (s *server) serve(r io.Reader, w io.Writer) error {
 			}
 			return nil
 		}
+		if req.Method == "" {
+			continue // the client's response to one of our requests
+		}
 
 		result, err := s.handle(req.Method, req.Params)
-		if req.ID == nil {
-			continue // notification
-		}
-		var resp any = response{JSONRPC: "2.0", ID: req.ID, Result: result}
-		if err != nil {
-			var rerr *rpcError
-			if !errors.As(err, &rerr) {
-				rerr = &rpcError{Code: -32602, Message: err.Error()} // InvalidParams
+		if req.ID != nil {
+			if err := writeMessage(w, reply(req.ID, result, err)); err != nil {
+				return err
 			}
-			resp = errorResponse{JSONRPC: "2.0", ID: req.ID, Error: rerr}
 		}
-		if err := writeMessage(w, resp); err != nil {
-			return err
+		for _, m := range s.outbox {
+			if err := writeMessage(w, m); err != nil {
+				return err
+			}
 		}
+		s.outbox = nil
 	}
+}
+
+// reply is the response to the request with the given id.
+func reply(id json.RawMessage, result any, err error) any {
+	if err == nil {
+		return response{JSONRPC: "2.0", ID: id, Result: result}
+	}
+	var rerr *rpcError
+	if !errors.As(err, &rerr) {
+		rerr = &rpcError{Code: -32602, Message: err.Error()} // InvalidParams
+	}
+	return errorResponse{JSONRPC: "2.0", ID: id, Error: rerr}
+}
+
+// send queues a message for the client, a request if id is set and a
+// notification otherwise.
+func (s *server) send(id any, method string, params any) {
+	s.outbox = append(s.outbox, message{JSONRPC: "2.0", ID: id, Method: method, Params: params})
 }
 
 func (s *server) handle(method string, params json.RawMessage) (any, error) {
 	switch method {
 	case "initialize":
 		return call(params, s.initialize)
+	case "initialized":
+		s.initialized()
+		return nil, nil
+	case "workspace/didChangeWatchedFiles":
+		// A stylesheet changed, which can change the diagnostics of any
+		// open document.
+		for uri := range s.docs {
+			s.publish(uri)
+		}
+		return nil, nil
 	case "textDocument/didOpen":
 		return call(params, s.didOpen)
 	case "textDocument/didChange":
@@ -193,6 +251,7 @@ func (s *server) initialize(p initializeParams) any {
 	}
 	s.root = uriToPath(root)
 	s.utf8 = slices.Contains(p.Capabilities.General.PositionEncodings, "utf-8")
+	s.watch = p.Capabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration
 	encoding := "utf-16"
 	if s.utf8 {
 		encoding = "utf-8"
@@ -208,21 +267,75 @@ func (s *server) initialize(p initializeParams) any {
 	}
 }
 
+// initialized asks the client to report changed stylesheets, since classes
+// added to or removed from them change the diagnostics of open documents.
+func (s *server) initialized() {
+	if !s.watch {
+		return
+	}
+	s.send("watch", "client/registerCapability", map[string]any{
+		"registrations": []any{map[string]any{
+			"id":     "css",
+			"method": "workspace/didChangeWatchedFiles",
+			"registerOptions": map[string]any{
+				"watchers": []any{map[string]any{"globPattern": "**/*.css"}},
+			},
+		}},
+	})
+}
+
 func (s *server) didOpen(p documentParams) any {
 	s.docs[p.TextDocument.URI] = p.TextDocument.Text
+	s.publish(p.TextDocument.URI)
 	return nil
 }
 
 func (s *server) didChange(p changeParams) any {
 	if n := len(p.ContentChanges); n > 0 {
 		s.docs[p.TextDocument.URI] = p.ContentChanges[n-1].Text
+		s.publish(p.TextDocument.URI)
 	}
 	return nil
 }
 
 func (s *server) didClose(p documentParams) any {
 	delete(s.docs, p.TextDocument.URI)
+	s.send(nil, "textDocument/publishDiagnostics", publishParams{URI: p.TextDocument.URI, Diagnostics: []diagnostic{}})
 	return nil
+}
+
+// publish sends the client the diagnostics of an open document.
+func (s *server) publish(uri string) {
+	s.send(nil, "textDocument/publishDiagnostics", publishParams{URI: uri, Diagnostics: s.diagnostics(uri, s.docs[uri])})
+}
+
+// diagnostics warns about the class names in a document that none of its
+// stylesheets define. When it can't see all of the page's CSS, or there is
+// none at all, there's nothing to go by and it reports nothing.
+func (s *server) diagnostics(uri, text string) []diagnostic {
+	found := []diagnostic{}
+	sheets, complete := stylesheets(uri, text, s.root)
+	if !complete || len(sheets) == 0 {
+		return found
+	}
+	defined := map[string]bool{}
+	for _, sheet := range sheets {
+		for _, c := range classes(sheet.text) {
+			defined[c.name] = true
+		}
+	}
+	for _, c := range classNames(text) {
+		if defined[c.name] {
+			continue
+		}
+		found = append(found, diagnostic{
+			Range:    span{s.position(text, c.start), s.position(text, c.end)},
+			Severity: severityWarning,
+			Source:   "html-class-lsp",
+			Message:  fmt.Sprintf("class %q isn't defined in the stylesheets this page loads", c.name),
+		})
+	}
+	return found
 }
 
 func (s *server) completion(p positionParams) completionList {
@@ -247,7 +360,8 @@ func (s *server) completion(p positionParams) completionList {
 	}
 	replace := span{s.position(text, offset-len(partial)), s.position(text, offset)}
 
-	for _, sheet := range stylesheets(p.TextDocument.URI, text, s.root) {
+	sheets, _ := stylesheets(p.TextDocument.URI, text, s.root)
+	for _, sheet := range sheets {
 		for _, c := range classes(sheet.text) {
 			if present[c.name] {
 				continue
@@ -283,7 +397,8 @@ func (s *server) definition(p positionParams) []location {
 		return locations
 	}
 
-	for _, sheet := range stylesheets(p.TextDocument.URI, text, s.root) {
+	sheets, _ := stylesheets(p.TextDocument.URI, text, s.root)
+	for _, sheet := range sheets {
 		for _, c := range classes(sheet.text) {
 			if c.name == name {
 				locations = append(locations, location{

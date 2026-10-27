@@ -1,6 +1,7 @@
 // html-class-lsp is a language server that completes CSS class names in HTML
-// class attributes, using the stylesheets the document actually links, and
-// jumps from a class to its definition.
+// class attributes, using the stylesheets the document actually links, jumps
+// from a class to its definition, and warns about classes none of them
+// define.
 package main
 
 import (

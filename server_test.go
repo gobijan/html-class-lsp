@@ -8,21 +8,28 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // client talks to a server over in-memory pipes, like an editor would.
 type client struct {
-	t      *testing.T
-	in     *io.PipeWriter
-	out    *bufio.Reader
-	nextID int
-	done   chan error
+	t         *testing.T
+	in        *io.PipeWriter
+	nextID    int
+	responses chan wireMessage
+	done      chan error
+
+	mu       sync.Mutex
+	received []wireMessage // requests and notifications from the server
 }
 
-type wireResponse struct {
+type wireMessage struct {
 	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 	Result json.RawMessage `json:"result"`
 	Error  *rpcError       `json:"error"`
 }
@@ -33,17 +40,47 @@ func startServer(t *testing.T, encodings []string, params map[string]any) *clien
 	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	c := &client{t: t, in: inW, out: bufio.NewReader(outR), done: make(chan error, 1)}
+	c := &client{t: t, in: inW, responses: make(chan wireMessage), done: make(chan error, 1)}
 	go func() {
 		c.done <- newServer().serve(inR, outW)
 		_ = outW.Close()
 	}()
 	t.Cleanup(func() { _ = inW.Close() })
 
+	// Read whatever the server sends as soon as it does, so it's never stuck
+	// writing a notification while the test is writing to it.
+	go func() {
+		out := bufio.NewReader(outR)
+		for {
+			body, err := readMessage(out)
+			if err != nil {
+				close(c.responses)
+				return
+			}
+			var m wireMessage
+			if err := json.Unmarshal(body, &m); err != nil {
+				t.Error(err)
+				continue
+			}
+			if m.Method == "" {
+				c.responses <- m
+				continue
+			}
+			c.mu.Lock()
+			c.received = append(c.received, m)
+			c.mu.Unlock()
+		}
+	}()
+
 	if params == nil {
 		params = map[string]any{}
 	}
-	params["capabilities"] = map[string]any{"general": map[string]any{"positionEncodings": encodings}}
+	capabilities, _ := params["capabilities"].(map[string]any)
+	if capabilities == nil {
+		capabilities = map[string]any{}
+		params["capabilities"] = capabilities
+	}
+	capabilities["general"] = map[string]any{"positionEncodings": encodings}
 	var init struct {
 		Capabilities struct {
 			PositionEncoding string `json:"positionEncoding"`
@@ -83,13 +120,9 @@ func (c *client) request(method string, params, result any) *rpcError {
 	c.nextID++
 	c.send(map[string]any{"id": c.nextID, "method": method, "params": params})
 
-	body, err := readMessage(c.out)
-	if err != nil {
-		c.t.Fatal(err)
-	}
-	var resp wireResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		c.t.Fatal(err)
+	resp, ok := <-c.responses
+	if !ok {
+		c.t.Fatal("server closed the connection")
 	}
 	if want := fmt.Sprint(c.nextID); string(resp.ID) != want {
 		c.t.Fatalf("response id %s, want %s", resp.ID, want)
@@ -136,6 +169,46 @@ func (c *client) define(uri string, pos position) []location {
 		c.t.Fatal(err)
 	}
 	return locations
+}
+
+// sync waits until the server has handled everything sent to it so far. It
+// answers in order, so once a request is answered, so is all before it.
+func (c *client) sync() {
+	c.t.Helper()
+	_ = c.request("test/sync", nil, nil) // answered with MethodNotFound
+}
+
+// messages returns the params of the requests and notifications with the
+// given method the server sent so far.
+func (c *client) messages(method string) []json.RawMessage {
+	c.t.Helper()
+	c.sync()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var params []json.RawMessage
+	for _, m := range c.received {
+		if m.Method == method {
+			params = append(params, m.Params)
+		}
+	}
+	return params
+}
+
+// diagnostics returns the diagnostics the server last published for uri, or
+// nil if it published none.
+func (c *client) diagnostics(uri string) []diagnostic {
+	c.t.Helper()
+	var latest []diagnostic
+	for _, raw := range c.messages("textDocument/publishDiagnostics") {
+		var p publishParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			c.t.Fatal(err)
+		}
+		if p.URI == uri {
+			latest = p.Diagnostics
+		}
+	}
+	return latest
 }
 
 func at(uri string, pos position) map[string]any {
@@ -242,6 +315,100 @@ func TestDocumentLifecycle(t *testing.T) {
 	}
 }
 
+func TestDiagnostics(t *testing.T) {
+	for _, encoding := range []string{"utf-16", "utf-8"} {
+		t.Run(encoding, func(t *testing.T) {
+			_, uri := setupProject(t)
+			c := startServer(t, []string{encoding}, nil)
+			pos := c.open(uri, `<link rel="stylesheet" href="style.css">
+<style>.inline {}</style>
+<p>Größe 🙂</p><div class="card |crad inline"></div>`, encoding == "utf-8")
+
+			want := []diagnostic{{
+				Range:    span{pos, position{pos.Line, pos.Character + 4}},
+				Severity: severityWarning,
+				Source:   "html-class-lsp",
+				Message:  `class "crad" isn't defined in the stylesheets this page loads`,
+			}}
+			if got := c.diagnostics(uri); !slices.Equal(got, want) {
+				t.Errorf("diagnostics = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestDiagnosticsLifecycle(t *testing.T) {
+	_, uri := setupProject(t)
+	c := startServer(t, nil, nil)
+	change := func(text string) {
+		c.notify("textDocument/didChange", map[string]any{
+			"textDocument":   map[string]any{"uri": uri},
+			"contentChanges": []any{map[string]any{"text": text}},
+		})
+	}
+	link := `<link rel="stylesheet" href="style.css">`
+
+	c.open(uri, link+`<div class="nope">`, false)
+	if got := c.diagnostics(uri); len(got) != 1 {
+		t.Fatalf("diagnostics = %+v, want one for nope", got)
+	}
+	change(link + `<div class="card">`)
+	if got := c.diagnostics(uri); len(got) != 0 {
+		t.Errorf("diagnostics after the fix = %+v, want none", got)
+	}
+
+	// Without all of the page's CSS, or any, there's nothing to go by.
+	change(link + `<link rel="stylesheet" href="https://cdn.example.com/x.css"><div class="nope">`)
+	if got := c.diagnostics(uri); len(got) != 0 {
+		t.Errorf("diagnostics with a remote stylesheet = %+v, want none", got)
+	}
+	change(`<div class="nope">`)
+	if got := c.diagnostics(uri); len(got) != 0 {
+		t.Errorf("diagnostics without stylesheets = %+v, want none", got)
+	}
+
+	change(link + `<div class="nope">`)
+	c.notify("textDocument/didClose", map[string]any{"textDocument": map[string]any{"uri": uri}})
+	if got := c.diagnostics(uri); len(got) != 0 {
+		t.Errorf("diagnostics after closing = %+v, want them cleared", got)
+	}
+}
+
+func TestWatchedStylesheets(t *testing.T) {
+	dir, uri := setupProject(t)
+	c := startServer(t, nil, map[string]any{"capabilities": map[string]any{
+		"workspace": map[string]any{"didChangeWatchedFiles": map[string]any{"dynamicRegistration": true}},
+	}})
+	registrations := c.messages("client/registerCapability")
+	if len(registrations) != 1 || !strings.Contains(string(registrations[0]), `"globPattern":"**/*.css"`) {
+		t.Fatalf("registrations = %s, want one that watches CSS files", registrations)
+	}
+	// The client's answer to the registration gets no response.
+	c.send(map[string]any{"id": "watch", "result": nil})
+
+	c.open(uri, `<link rel="stylesheet" href="style.css"><div class="card fresh">`, false)
+	if got := c.diagnostics(uri); len(got) != 1 {
+		t.Fatalf("diagnostics = %+v, want one for fresh", got)
+	}
+	css := filepath.Join(dir, "style.css")
+	if err := os.WriteFile(css, []byte(".card {} .fresh {}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.notify("workspace/didChangeWatchedFiles", map[string]any{
+		"changes": []any{map[string]any{"uri": pathToURI(css), "type": 2}},
+	})
+	if got := c.diagnostics(uri); len(got) != 0 {
+		t.Errorf("diagnostics after defining fresh = %+v, want none", got)
+	}
+}
+
+func TestNoWatchWithoutDynamicRegistration(t *testing.T) {
+	c := startServer(t, nil, nil)
+	if got := c.messages("client/registerCapability"); len(got) != 0 {
+		t.Errorf("registrations = %s, want none", got)
+	}
+}
+
 func TestRootRelativeHref(t *testing.T) {
 	dir, _ := setupProject(t)
 	uri := pathToURI(filepath.Join(dir, "sub", "page.html"))
@@ -328,9 +495,16 @@ type failingWriter struct{}
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
 
 func TestServeWriteError(t *testing.T) {
-	err := newServer().serve(strings.NewReader(frame(`{"id":1,"method":"shutdown"}`)), failingWriter{})
-	if err == nil || err.Error() != "disk full" {
-		t.Errorf("serve error = %v, want the write error", err)
+	for name, msg := range map[string]string{
+		"response":     `{"id":1,"method":"shutdown"}`,
+		"notification": `{"method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///x.html","text":""}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := newServer().serve(strings.NewReader(frame(msg)), failingWriter{})
+			if err == nil || err.Error() != "disk full" {
+				t.Errorf("serve error = %v, want the write error", err)
+			}
+		})
 	}
 }
 

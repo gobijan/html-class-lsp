@@ -25,44 +25,54 @@ var (
 	styleBlock    = regexp.MustCompile(`(?is)<style\b[^>]*>(.*?)</style>`)
 	cssImport     = regexp.MustCompile(`(?i)@import\s+(?:url\(\s*)?["']?([^"')\s;]+)`)
 	remoteRef     = regexp.MustCompile(`(?i)^(?:[a-z][a-z0-9+.-]*:)?//|^data:`)
+	scriptOrStyle = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>`)
+
+	// Font services serve nothing but @font-face rules, except for icon
+	// fonts, which come with classes like .material-icons.
+	fontService = regexp.MustCompile(`(?i)^(?:https?:)?//fonts\.(?:googleapis\.com|bunny\.net)/`)
+	iconFont    = regexp.MustCompile(`(?i)icon|symbol`)
+
+	// Scripts that generate styles in the browser, like the Tailwind CDN.
+	styleScript = regexp.MustCompile(`(?i)<script\b[^>]*\bsrc\s*=\s*["']?[^"'\s>]*(?:tailwind|unocss|twind)`)
 
 	// The value of a class attribute up to the end of the text, i.e. the
 	// cursor. The leading group stands in for a lookbehind, which RE2 lacks,
 	// so that data-class="…" doesn't count.
 	classAttr = regexp.MustCompile(`(?i)(?:^|[^\w-])class\s*=\s*(?:"([^"]*)|'([^']*))$`)
+
+	// A whole class attribute. Bound ones like :class="…" in Vue or Alpine
+	// hold an expression rather than class names, so they don't count.
+	classAttrs = regexp.MustCompile(`(?i)(?:^|[^\w:-])class\s*=\s*(?:"([^"]*)"|'([^']*)')`)
 )
 
 // stylesheets returns the stylesheets that apply to an HTML document: local
 // files from <link rel="stylesheet">, the files those @import, and the
 // document's own <style> blocks. Root-relative hrefs ("/css/site.css") are
 // resolved against root, or the document's directory if root is empty.
-func stylesheets(uri, html, root string) []stylesheet {
-	html = htmlComment.ReplaceAllStringFunc(html, func(c string) string {
-		b := []byte(c)
-		blank(b, 0, len(b))
-		return string(b)
-	})
+//
+// complete reports whether that's all the CSS the page gets. It isn't when a
+// stylesheet is remote or can't be read, or when a script like the Tailwind
+// CDN generates styles in the browser.
+func stylesheets(uri, html, root string) (sheets []stylesheet, complete bool) {
+	html = blankMatches(html, htmlComment)
 
 	// Without a file path (an unsaved buffer) there's nothing to resolve
 	// links and imports against, only the <style> blocks count.
-	path := uriToPath(uri)
-	dir := filepath.Dir(path)
+	dir := ""
+	if path := uriToPath(uri); path != "" {
+		dir = filepath.Dir(path)
+	}
 	if root == "" {
 		root = dir
 	}
-	var sheets []stylesheet
-	seen := map[string]bool{}
+	c := &collector{root: root, seen: map[string]bool{}, complete: !styleScript.MatchString(html)}
 
-	if path != "" {
-		for _, tag := range linkTag.FindAllString(html, -1) {
-			if !relStylesheet.MatchString(tag) {
-				continue
-			}
-			if m := hrefAttr.FindStringSubmatch(tag); m != nil {
-				if file, ok := resolve(strings.Join(m[1:], ""), dir, root); ok {
-					sheets = readSheet(sheets, seen, file, root)
-				}
-			}
+	for _, tag := range linkTag.FindAllString(html, -1) {
+		if !relStylesheet.MatchString(tag) {
+			continue
+		}
+		if m := hrefAttr.FindStringSubmatch(tag); m != nil {
+			c.add(strings.Join(m[1:], ""), dir)
 		}
 	}
 
@@ -75,43 +85,55 @@ func stylesheets(uri, html, root string) []stylesheet {
 		}
 		blank(b, last, len(b))
 		inline := string(b)
-		sheets = append(sheets, stylesheet{uri: uri, label: "<style>", text: inline})
-		if path != "" {
-			sheets = readImports(sheets, seen, inline, dir, root)
-		}
+		c.sheets = append(c.sheets, stylesheet{uri: uri, label: "<style>", text: inline})
+		c.imports(inline, dir)
 	}
-	return sheets
+	return c.sheets, c.complete
 }
 
-func readSheet(sheets []stylesheet, seen map[string]bool, file, root string) []stylesheet {
-	if seen[file] {
-		return sheets
+// collector gathers the stylesheets of a document.
+type collector struct {
+	root     string
+	sheets   []stylesheet
+	seen     map[string]bool
+	complete bool
+}
+
+// add reads the stylesheet that ref points to from dir, and the files it
+// imports.
+func (c *collector) add(ref, dir string) {
+	file, ok := resolve(ref, dir, c.root)
+	if !ok {
+		c.complete = c.complete && fontService.MatchString(ref) && !iconFont.MatchString(ref)
+		return
 	}
-	seen[file] = true
+	if c.seen[file] {
+		return
+	}
+	c.seen[file] = true
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return sheets
+		c.complete = false
+		return
 	}
 	text := string(data)
-	sheets = append(sheets, stylesheet{uri: pathToURI(file), label: filepath.Base(file), text: text})
-	return readImports(sheets, seen, text, filepath.Dir(file), root)
+	c.sheets = append(c.sheets, stylesheet{uri: pathToURI(file), label: filepath.Base(file), text: text})
+	c.imports(text, filepath.Dir(file))
 }
 
-// readImports reads the files that css pulls in with @import, resolving them
+// imports adds the files that css pulls in with @import, resolving them
 // against dir.
-func readImports(sheets []stylesheet, seen map[string]bool, css, dir, root string) []stylesheet {
+func (c *collector) imports(css, dir string) {
 	for _, m := range cssImport.FindAllStringSubmatch(mask(css, false), -1) {
-		if file, ok := resolve(m[1], dir, root); ok {
-			sheets = readSheet(sheets, seen, file, root)
-		}
+		c.add(m[1], dir)
 	}
-	return sheets
 }
 
 // resolve turns a stylesheet reference into a local file path. Remote and
-// data: URLs can't be read and report false.
+// data: URLs can't be read and report false, and so does everything when
+// there's no directory to resolve against.
 func resolve(ref, dir, root string) (string, bool) {
-	if ref == "" || remoteRef.MatchString(ref) {
+	if ref == "" || dir == "" || remoteRef.MatchString(ref) {
 		return "", false
 	}
 	ref, _, _ = strings.Cut(ref, "#")
@@ -133,6 +155,44 @@ func classValueBefore(text string, offset int) (string, bool) {
 		return "", false
 	}
 	return m[1] + m[2], true
+}
+
+// classNames returns the class names in the class attributes of html, in
+// source order. Only markup counts, not comments, scripts or <style> blocks.
+// A value with template tags like {{ … }}, {% … %} or <?= … ?> is skipped
+// entirely, its classes are only known once the page is rendered.
+func classNames(html string) []class {
+	html = blankMatches(blankMatches(html, htmlComment), scriptOrStyle)
+	var found []class
+	for _, m := range classAttrs.FindAllStringSubmatchIndex(html, -1) {
+		start, end := m[2], m[3]
+		if start < 0 {
+			start, end = m[4], m[5]
+		}
+		if strings.ContainsAny(html[start:end], "{<") {
+			continue
+		}
+		for i := start; i < end; i++ {
+			j := i
+			for j < end && !isSeparator(html[j]) {
+				j++
+			}
+			if j > i {
+				found = append(found, class{name: html[i:j], start: i, end: j})
+			}
+			i = j
+		}
+	}
+	return found
+}
+
+// blankMatches blanks out every match of re in s, keeping offsets the same.
+func blankMatches(s string, re *regexp.Regexp) string {
+	return re.ReplaceAllStringFunc(s, func(m string) string {
+		b := []byte(m)
+		blank(b, 0, len(b))
+		return string(b)
+	})
 }
 
 func uriToPath(uri string) string {

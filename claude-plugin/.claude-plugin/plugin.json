@@ -1,0 +1,9 @@
+{
+  "name": "html-class-lsp",
+  "description": "Warnings for CSS classes in HTML that none of the page's stylesheets define, and go to definition from a class to its rule",
+  "author": { "name": "Bijan Rahnema" },
+  "homepage": "https://github.com/gobijan/html-class-lsp",
+  "repository": "https://github.com/gobijan/html-class-lsp",
+  "license": "MIT",
+  "keywords": ["html", "css", "lsp"]
+}

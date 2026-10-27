@@ -1,0 +1,9 @@
+{
+  "html-class-lsp": {
+    "command": "html-class-lsp",
+    "extensionToLanguage": {
+      ".html": "html",
+      ".htm": "html"
+    }
+  }
+}

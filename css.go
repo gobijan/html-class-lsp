@@ -7,9 +7,10 @@ import (
 	"unicode/utf8"
 )
 
-// class is a class selector found in a stylesheet. start and end are byte
-// offsets of ".name" in the source, so it can be turned back into a range for
-// go-to-definition.
+// class is a class selector found in a stylesheet, or a class name in an
+// HTML class attribute. start and end are byte offsets in the source of
+// ".name" or "name", so it can be turned back into a range for
+// go-to-definition and diagnostics.
 type class struct {
 	name       string
 	start, end int
